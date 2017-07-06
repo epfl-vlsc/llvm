@@ -91,10 +91,8 @@ FunctionPass *llvm::createSafepointIRVerifierPass() {
   return new SafepointIRVerifier();
 }
 
-INITIALIZE_PASS_BEGIN(SafepointIRVerifier, "verify-safepoint-ir",
+INITIALIZE_PASS(SafepointIRVerifier, "verify-safepoint-ir",
                       "Safepoint IR Verifier", false, true)
-INITIALIZE_PASS_END(SafepointIRVerifier, "verify-safepoint-ir",
-                    "Safepoint IR Verifier", false, true)
 
 static bool isGCPointerType(Type *T) {
   if (auto *PT = dyn_cast<PointerType>(T))
