@@ -2,6 +2,7 @@ add_llvm_library(LLVMInstrumentation
   AddressSanitizer.cpp
   BoundsChecking.cpp
   DataFlowSanitizer.cpp
+        Heapologist.cpp
   GCOVProfiling.cpp
   MemorySanitizer.cpp
   IndirectCallPromotion.cpp

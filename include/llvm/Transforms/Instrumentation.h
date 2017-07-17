@@ -130,8 +130,18 @@ struct EfficiencySanitizerOptions {
 };
 
 // Insert EfficiencySanitizer instrumentation.
-ModulePass *createEfficiencySanitizerPass(
-    const EfficiencySanitizerOptions &Options = EfficiencySanitizerOptions());
+  ModulePass *createEfficiencySanitizerPass(
+          const EfficiencySanitizerOptions &Options = EfficiencySanitizerOptions());
+
+  // Options for Heapologist sub-tools.
+  struct HeapologistOptions {
+    int test_op = 0;
+    HeapologistOptions() = default;
+  };
+
+  // Insert EfficiencySanitizer instrumentation.
+  ModulePass *createHeapologistPass(
+          const HeapologistOptions &Options = HeapologistOptions());
 
 // Options for sanitizer coverage instrumentation.
 struct SanitizerCoverageOptions {
