@@ -1,4 +1,4 @@
-//===-- Heapologist.cpp - performance tuner -----------------------===//
+//===-- Heapologist.cpp ---------------------------------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,8 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file is a part of Heapologist, a family of performance tuners
-// that detects multiple performance issues via separate sub-tools.
+// This file is a part of Heapologist, a tool to detect inefficient heap
+// usage patterns. This file was adapted from the EfficiencySanitizer
+// instrumentation.
 //
 // The instrumentation phase is straightforward:
 //   - Take action on every memory access: either inlined instrumentation,
@@ -436,7 +437,7 @@ bool Heapologist::runOnModule(Module &M) {
 bool Heapologist::runOnFunction(Function &F, Module &M) {
   // This is required to prevent instrumenting the call to __hplgst_init from
   // within the module constructor.
-  errs() << "running heapologist instrumenter on function!\n";
+  //errs() << "running heapologist instrumenter on function!\n";
   if (&F == HplgstCtorFunction)
     return false;
   SmallVector<Instruction *, 8> LoadsAndStores;
