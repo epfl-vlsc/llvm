@@ -36,7 +36,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
-
+#include <cxxabi.h>
 using namespace llvm;
 
 #define DEBUG_TYPE "hplgst"
@@ -178,6 +178,7 @@ private:
                                    Value *Addr, unsigned Alignment);
   bool instrumentFastpathWorkingSet(Instruction *I, const DataLayout &DL,
                                     Value *Addr, unsigned Alignment);
+  void maybeInstrumentMallocNew(CallInst *CI);
 
   HeapologistOptions Options;
   LLVMContext *Ctx;
@@ -434,6 +435,20 @@ bool Heapologist::runOnModule(Module &M) {
   return Res;
 }
 
+void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
+  // saying right now there is probably a better way to do this,
+  // like get pointer to alloc functions and compare those?
+  // but not sure how to do and this works :-P
+  Function *F = CI->getCalledFunction();
+  int     status;
+  char   *realname;
+  realname = abi::__cxa_demangle(F->getName().str().c_str(), 0, 0, &status);
+  if (F->getName().compare("malloc") == 0 || (realname && strcmp(realname, "operator new[](unsigned long)") == 0)
+          || (realname && strcmp(realname, "operator new(unsigned long)") == 0))
+    errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
+  free(realname);
+}
+
 bool Heapologist::runOnFunction(Function &F, Module &M) {
   // This is required to prevent instrumenting the call to __hplgst_init from
   // within the module constructor.
@@ -458,8 +473,10 @@ bool Heapologist::runOnFunction(Function &F, Module &M) {
         MemIntrinCalls.push_back(&Inst);
       else if (isa<GetElementPtrInst>(Inst))
         GetElementPtrs.push_back(&Inst);
-      else if (CallInst *CI = dyn_cast<CallInst>(&Inst))
+      else if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
         maybeMarkSanitizerLibraryCallNoBuiltin(CI, TLI);
+        maybeInstrumentMallocNew(CI);
+      }
     }
   }
 
