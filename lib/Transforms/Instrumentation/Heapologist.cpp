@@ -36,7 +36,11 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <fstream>
+#include <sys/stat.h>
 #include <cxxabi.h>
+#include <llvm/IR/DebugInfoMetadata.h>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "hplgst"
@@ -131,7 +135,11 @@ class Heapologist : public ModulePass {
 public:
   Heapologist(
       const HeapologistOptions &Opts = HeapologistOptions())
-      : ModulePass(ID), Options(OverrideOptionsFromCL(Opts)) {}
+      : ModulePass(ID), Options(OverrideOptionsFromCL(Opts)) {
+  }
+  ~Heapologist() {
+    type_file.close();
+  }
   StringRef getPassName() const override;
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   bool runOnModule(Module &M) override;
@@ -179,6 +187,7 @@ private:
   bool instrumentFastpathWorkingSet(Instruction *I, const DataLayout &DL,
                                     Value *Addr, unsigned Alignment);
   void maybeInstrumentMallocNew(CallInst *CI);
+  void instrumentMallocNew(CallInst *CI, StringRef const& name);
 
   HeapologistOptions Options;
   LLVMContext *Ctx;
@@ -198,6 +207,7 @@ private:
   // Remember the counter variable for each struct type to avoid
   // recomputing the variable name later during instrumentation.
   std::map<Type *, GlobalVariable *> StructTyMap;
+  std::ofstream type_file;
 };
 } // namespace
 
@@ -382,6 +392,11 @@ void Heapologist::createDestructor(Module &M, Constant *ToolInfoArg) {
 bool Heapologist::initOnModule(Module &M) {
 
 
+  mkdir("typefiles", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH); // just needs to exist, dont care if it fails
+  SmallString<4096> filename("typefiles/");
+  filename += M.getName().str() + ".types";
+  type_file.open(filename.str(), std::ios::out);
+
   Ctx = &M.getContext();
   const DataLayout &DL = M.getDataLayout();
   IRBuilder<> IRB(M.getContext());
@@ -435,6 +450,45 @@ bool Heapologist::runOnModule(Module &M) {
   return Res;
 }
 
+void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
+
+  //Instruction* inst = CI->getNextNode();
+  auto& loc = CI->getDebugLoc();
+  auto* diloc = loc.get();
+/*  errs() << "num users is " << CI->getNumUses() << "\n";
+  errs() << "file name " << diloc->getFilename() << ":" << diloc->getLine() << "\n";*/
+  Type* t = nullptr;
+  for (auto it = CI->user_begin(); it != CI->user_end(); it++) {
+    if (isa<CastInst>(*it)) {
+      if (!t)
+        t = it->getType();
+      if (t && it->getType()->isStructTy())
+        t = it->getType();
+
+/*      Type* n_t = it->getType();
+      errs() << "the user type is ";
+      n_t->print(errs(), true, true);
+      errs() << "\n";
+      it->dump();*/
+    }
+  }
+  if (t) {
+    std::string type_name;
+    llvm::raw_string_ostream rso(type_name);
+    if (t->isStructTy())
+      type_name = t->getStructName();
+    else {
+      t->print(rso);
+      type_name = rso.str();
+    }
+    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << type_name << "\n";
+
+  } else {
+    // no cast found means that its char*
+    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << "i8*" << "\n";
+  }
+}
+
 void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
   // saying right now there is probably a better way to do this,
   // like get pointer to alloc functions and compare those?
@@ -443,9 +497,18 @@ void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
   int     status;
   char   *realname;
   realname = abi::__cxa_demangle(F->getName().str().c_str(), 0, 0, &status);
+/*  if (F->getName().compare("llvm.dbg.value"))
+    errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";*/
   if (F->getName().compare("malloc") == 0 || (realname && strcmp(realname, "operator new[](unsigned long)") == 0)
-          || (realname && strcmp(realname, "operator new(unsigned long)") == 0))
+          || (realname && strcmp(realname, "operator new(unsigned long)") == 0)){
     errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
+    if (realname) {
+      StringRef name(realname);
+      instrumentMallocNew(CI, name);
+    } else {
+      instrumentMallocNew(CI, F->getName());
+    }
+  }
   free(realname);
 }
 
