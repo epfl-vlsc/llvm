@@ -47,12 +47,7 @@ using namespace llvm;
 
 // The tool type must be just one of these ClTool* options, as the tools
 // cannot be combined due to shadow memory constraints.
-/*static cl::opt<bool>
-    ClToolCacheFrag("esan-cache-frag", cl::init(false),
-                    cl::desc("Detect data cache fragmentation"), cl::Hidden);
-static cl::opt<bool>
-    ClToolWorkingSet("esan-working-set", cl::init(false),
-                    cl::desc("Measure the working set size"), cl::Hidden);*/
+
 // Each new tool will get its own opt flag here.
 // These are converted to HeapologistOptions for use
 // in the code.
@@ -101,10 +96,6 @@ static const char *const HplgstExitName = "__hplgst_exit";
 static const char *const HplgstWhichToolName = "__hplgst_which_tool";
 
 
-// MaxStructCounterNameSize is a soft size limit to avoid insanely long
-// names for those extremely large structs.
-static const unsigned MaxStructCounterNameSize = 512;
-
 namespace {
 
 static HeapologistOptions
@@ -148,44 +139,13 @@ public:
 private:
   bool initOnModule(Module &M);
   void initializeCallbacks(Module &M);
-  bool shouldIgnoreStructType(StructType *StructTy);
-  void createStructCounterName(
-      StructType *StructTy, SmallString<MaxStructCounterNameSize> &NameStr);
-  void createCacheFragAuxGV(
-    Module &M, const DataLayout &DL, StructType *StructTy,
-    GlobalVariable *&TypeNames, GlobalVariable *&Offsets, GlobalVariable *&Size);
-  GlobalVariable *createCacheFragInfoGV(Module &M, const DataLayout &DL,
-                                        Constant *UnitName);
   Constant *createHplgstInitToolInfoArg(Module &M, const DataLayout &DL);
   void createDestructor(Module &M, Constant *ToolInfoArg);
   bool runOnFunction(Function &F, Module &M);
   bool instrumentLoadOrStore(Instruction *I, const DataLayout &DL);
   bool instrumentMemIntrinsic(MemIntrinsic *MI);
-  bool instrumentGetElementPtr(Instruction *I, Module &M);
-  bool insertCounterUpdate(Instruction *I, StructType *StructTy,
-                           unsigned CounterIdx);
-  unsigned getFieldCounterIdx(StructType *StructTy) {
-    return 0;
-  }
-  unsigned getArrayCounterIdx(StructType *StructTy) {
-    return StructTy->getNumElements();
-  }
-  unsigned getStructCounterSize(StructType *StructTy) {
-    // The struct counter array includes:
-    // - one counter for each struct field,
-    // - one counter for the struct access within an array.
-    return (StructTy->getNumElements()/*field*/ + 1/*array*/);
-  }
   bool shouldIgnoreMemoryAccess(Instruction *I);
   int getMemoryAccessFuncIndex(Value *Addr, const DataLayout &DL);
-  Value *appToShadow(Value *Shadow, IRBuilder<> &IRB);
-  bool instrumentFastpath(Instruction *I, const DataLayout &DL, bool IsStore,
-                          Value *Addr, unsigned Alignment);
-  // Each tool has its own fastpath routine:
-  bool instrumentFastpathCacheFrag(Instruction *I, const DataLayout &DL,
-                                   Value *Addr, unsigned Alignment);
-  bool instrumentFastpathWorkingSet(Instruction *I, const DataLayout &DL,
-                                    Value *Addr, unsigned Alignment);
   void maybeInstrumentMallocNew(CallInst *CI);
   void instrumentMallocNew(CallInst *CI, StringRef const& name);
 
@@ -204,9 +164,7 @@ private:
   Function *MemmoveFn, *MemcpyFn, *MemsetFn;
   Function *HplgstCtorFunction;
   Function *HplgstDtorFunction;
-  // Remember the counter variable for each struct type to avoid
-  // recomputing the variable name later during instrumentation.
-  std::map<Type *, GlobalVariable *> StructTyMap;
+  // file we will dump alloc point type info to
   std::ofstream type_file;
 };
 } // namespace
@@ -275,84 +233,13 @@ void Heapologist::initializeCallbacks(Module &M) {
                             IRB.getInt32Ty(), IntptrTy, nullptr));
 }
 
-bool Heapologist::shouldIgnoreStructType(StructType *StructTy) {
-  if (StructTy == nullptr || StructTy->isOpaque() /* no struct body */)
-    return true;
-  return false;
-}
-
-void Heapologist::createStructCounterName(
-    StructType *StructTy, SmallString<MaxStructCounterNameSize> &NameStr) {
-  // Append NumFields and field type ids to avoid struct conflicts
-  // with the same name but different fields.
-  if (StructTy->hasName())
-    NameStr += StructTy->getName();
-  else
-    NameStr += "struct.anon";
-  // We allow the actual size of the StructCounterName to be larger than
-  // MaxStructCounterNameSize and append $NumFields and at least one
-  // field type id.
-  // Append $NumFields.
-  NameStr += "$";
-  Twine(StructTy->getNumElements()).toVector(NameStr);
-  // Append struct field type ids in the reverse order.
-  for (int i = StructTy->getNumElements() - 1; i >= 0; --i) {
-    NameStr += "$";
-    Twine(StructTy->getElementType(i)->getTypeID()).toVector(NameStr);
-    if (NameStr.size() >= MaxStructCounterNameSize)
-      break;
-  }
-  if (StructTy->isLiteral()) {
-    // End with $ for literal struct.
-    NameStr += "$";
-  }
-}
 
 // Create global variables with auxiliary information (e.g., struct field size,
 // offset, and type name) for better user report.
-void Heapologist::createCacheFragAuxGV(
-    Module &M, const DataLayout &DL, StructType *StructTy,
-    GlobalVariable *&TypeName, GlobalVariable *&Offset,
-    GlobalVariable *&Size) {
-  auto *Int8PtrTy = Type::getInt8PtrTy(*Ctx);
-  auto *Int32Ty = Type::getInt32Ty(*Ctx);
-  // FieldTypeName.
-  auto *TypeNameArrayTy = ArrayType::get(Int8PtrTy, StructTy->getNumElements());
-  TypeName = new GlobalVariable(M, TypeNameArrayTy, true,
-                                 GlobalVariable::InternalLinkage, nullptr);
-  SmallVector<Constant *, 16> TypeNameVec;
-  // FieldOffset.
-  auto *OffsetArrayTy = ArrayType::get(Int32Ty, StructTy->getNumElements());
-  Offset = new GlobalVariable(M, OffsetArrayTy, true,
-                              GlobalVariable::InternalLinkage, nullptr);
-  SmallVector<Constant *, 16> OffsetVec;
-  // FieldSize
-  auto *SizeArrayTy = ArrayType::get(Int32Ty, StructTy->getNumElements());
-  Size = new GlobalVariable(M, SizeArrayTy, true,
-                            GlobalVariable::InternalLinkage, nullptr);
-  SmallVector<Constant *, 16> SizeVec;
-  for (unsigned i = 0; i < StructTy->getNumElements(); ++i) {
-    Type *Ty = StructTy->getElementType(i);
-    std::string Str;
-    raw_string_ostream StrOS(Str);
-    Ty->print(StrOS);
-    TypeNameVec.push_back(
-        ConstantExpr::getPointerCast(
-            createPrivateGlobalForString(M, StrOS.str(), true),
-            Int8PtrTy));
-    OffsetVec.push_back(
-        ConstantInt::get(Int32Ty,
-                         DL.getStructLayout(StructTy)->getElementOffset(i)));
-    SizeVec.push_back(ConstantInt::get(Int32Ty,
-                                       DL.getTypeAllocSize(Ty)));
-    }
-  TypeName->setInitializer(ConstantArray::get(TypeNameArrayTy, TypeNameVec));
-  Offset->setInitializer(ConstantArray::get(OffsetArrayTy, OffsetVec));
-  Size->setInitializer(ConstantArray::get(SizeArrayTy, SizeVec));
-}
 
 
 // Create the tool-specific argument passed to HplgstInit and HplgstExit.
+// TODO can probably get rid of this,
 Constant *Heapologist::createHplgstInitToolInfoArg(Module &M,
                                                          const DataLayout &DL) {
   // This structure contains tool-specific information about each compilation
@@ -452,11 +339,8 @@ bool Heapologist::runOnModule(Module &M) {
 
 void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
 
-  //Instruction* inst = CI->getNextNode();
   auto& loc = CI->getDebugLoc();
   auto* diloc = loc.get();
-/*  errs() << "num users is " << CI->getNumUses() << "\n";
-  errs() << "file name " << diloc->getFilename() << ":" << diloc->getLine() << "\n";*/
   Type* t = nullptr;
   for (auto it = CI->user_begin(); it != CI->user_end(); it++) {
     if (isa<CastInst>(*it)) {
@@ -464,12 +348,6 @@ void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
         t = it->getType();
       if (t && it->getType()->isStructTy())
         t = it->getType();
-
-/*      Type* n_t = it->getType();
-      errs() << "the user type is ";
-      n_t->print(errs(), true, true);
-      errs() << "\n";
-      it->dump();*/
     }
   }
   if (t) {
@@ -481,11 +359,11 @@ void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
       t->print(rso);
       type_name = rso.str();
     }
-    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << type_name << "\n";
+    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << "|" << type_name << "\n";
 
   } else {
-    // no cast found means that its char*
-    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << "i8*" << "\n";
+    // no cast found means that its basically char*
+    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << "|" << "i8*" << "\n";
   }
 }
 
@@ -497,8 +375,6 @@ void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
   int     status;
   char   *realname;
   realname = abi::__cxa_demangle(F->getName().str().c_str(), 0, 0, &status);
-/*  if (F->getName().compare("llvm.dbg.value"))
-    errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";*/
   if (F->getName().compare("malloc") == 0 || (realname && strcmp(realname, "operator new[](unsigned long)") == 0)
           || (realname && strcmp(realname, "operator new(unsigned long)") == 0)){
     errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
@@ -555,12 +431,6 @@ bool Heapologist::runOnFunction(Function &F, Module &M) {
     }
   }
 
-  //if (Options.ToolType == HeapologistOptions::ESAN_CacheFrag) {
-    for (auto Inst : GetElementPtrs) {
-      Res |= instrumentGetElementPtr(Inst, M);
-    }
-  //}
-
   return Res;
 }
 
@@ -608,11 +478,6 @@ bool Heapologist::instrumentLoadOrStore(Instruction *I,
                    {IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()),
                     ConstantInt::get(IntptrTy, TypeSizeBytes)});
   } else {
-    /*if (ClInstrumentFastpath &&
-        instrumentFastpath(I, DL, IsStore, Addr, Alignment)) {
-      NumFastpaths++;
-      return true;
-    }*/
     if (Alignment == 0 || (Alignment % TypeSizeBytes) == 0)
       OnAccessFunc = IsStore ? HplgstAlignedStore[Idx] : HplgstAlignedLoad[Idx];
     else
@@ -650,81 +515,7 @@ bool Heapologist::instrumentMemIntrinsic(MemIntrinsic *MI) {
   return Res;
 }
 
-bool Heapologist::instrumentGetElementPtr(Instruction *I, Module &M) {
-  GetElementPtrInst *GepInst = dyn_cast<GetElementPtrInst>(I);
-  bool Res = false;
-  if (GepInst == nullptr || GepInst->getNumIndices() == 1) {
-    ++NumIgnoredGEPs;
-    return false;
-  }
-  Type *SourceTy = GepInst->getSourceElementType();
-  StructType *StructTy = nullptr;
-  ConstantInt *Idx;
-  // Check if GEP calculates address from a struct array.
-  if (isa<StructType>(SourceTy)) {
-    StructTy = cast<StructType>(SourceTy);
-    Idx = dyn_cast<ConstantInt>(GepInst->getOperand(1));
-    if ((Idx == nullptr || Idx->getSExtValue() != 0) &&
-        !shouldIgnoreStructType(StructTy) && StructTyMap.count(StructTy) != 0)
-      Res |= insertCounterUpdate(I, StructTy, getArrayCounterIdx(StructTy));
-  }
-  // Iterate all (except the first and the last) idx within each GEP instruction
-  // for possible nested struct field address calculation.
-  for (unsigned i = 1; i < GepInst->getNumIndices(); ++i) {
-    SmallVector<Value *, 8> IdxVec(GepInst->idx_begin(),
-                                   GepInst->idx_begin() + i);
-    Type *Ty = GetElementPtrInst::getIndexedType(SourceTy, IdxVec);
-    unsigned CounterIdx = 0;
-    if (isa<ArrayType>(Ty)) {
-      ArrayType *ArrayTy = cast<ArrayType>(Ty);
-      StructTy = dyn_cast<StructType>(ArrayTy->getElementType());
-      if (shouldIgnoreStructType(StructTy) || StructTyMap.count(StructTy) == 0)
-        continue;
-      // The last counter for struct array access.
-      CounterIdx = getArrayCounterIdx(StructTy);
-    } else if (isa<StructType>(Ty)) {
-      StructTy = cast<StructType>(Ty);
-      if (shouldIgnoreStructType(StructTy) || StructTyMap.count(StructTy) == 0)
-        continue;
-      // Get the StructTy's subfield index.
-      Idx = cast<ConstantInt>(GepInst->getOperand(i+1));
-      assert(Idx->getSExtValue() >= 0 &&
-             Idx->getSExtValue() < StructTy->getNumElements());
-      CounterIdx = getFieldCounterIdx(StructTy) + Idx->getSExtValue();
-    }
-    Res |= insertCounterUpdate(I, StructTy, CounterIdx);
-  }
-  if (Res)
-    ++NumInstrumentedGEPs;
-  else
-    ++NumIgnoredGEPs;
-  return Res;
-}
 
-bool Heapologist::insertCounterUpdate(Instruction *I,
-                                              StructType *StructTy,
-                                              unsigned CounterIdx) {
-  GlobalVariable *CounterArray = StructTyMap[StructTy];
-  if (CounterArray == nullptr)
-    return false;
-  IRBuilder<> IRB(I);
-  Constant *Indices[2];
-  // Xref http://llvm.org/docs/LangRef.html#i-getelementptr and
-  // http://llvm.org/docs/GetElementPtr.html.
-  // The first index of the GEP instruction steps through the first operand,
-  // i.e., the array itself.
-  Indices[0] = ConstantInt::get(IRB.getInt32Ty(), 0);
-  // The second index is the index within the array.
-  Indices[1] = ConstantInt::get(IRB.getInt32Ty(), CounterIdx);
-  Constant *Counter =
-    ConstantExpr::getGetElementPtr(
-        ArrayType::get(IRB.getInt64Ty(), getStructCounterSize(StructTy)),
-        CounterArray, Indices);
-  Value *Load = IRB.CreateLoad(Counter);
-  IRB.CreateStore(IRB.CreateAdd(Load, ConstantInt::get(IRB.getInt64Ty(), 1)),
-                  Counter);
-  return true;
-}
 
 int Heapologist::getMemoryAccessFuncIndex(Value *Addr,
                                                   const DataLayout &DL) {
@@ -744,78 +535,5 @@ int Heapologist::getMemoryAccessFuncIndex(Value *Addr,
   return Idx;
 }
 
-/*bool Heapologist::instrumentFastpath(Instruction *I,
-                                             const DataLayout &DL, bool IsStore,
-                                             Value *Addr, unsigned Alignment) {
-  if (Options.ToolType == HeapologistOptions::ESAN_CacheFrag) {
-    return instrumentFastpathCacheFrag(I, DL, Addr, Alignment);
-  } else if (Options.ToolType == HeapologistOptions::ESAN_WorkingSet) {
-    return instrumentFastpathWorkingSet(I, DL, Addr, Alignment);
-  }
-  return false;
-}*/
 
-bool Heapologist::instrumentFastpathCacheFrag(Instruction *I,
-                                                      const DataLayout &DL,
-                                                      Value *Addr,
-                                                      unsigned Alignment) {
-  // Do nothing.
-  return true; // Return true to avoid slowpath instrumentation.
-}
 
-/*bool Heapologist::instrumentFastpathWorkingSet(
-    Instruction *I, const DataLayout &DL, Value *Addr, unsigned Alignment) {
-  assert(ShadowScale[Options.ToolType] == 6); // The code below assumes this
-  IRBuilder<> IRB(I);
-  Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
-  const uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
-  // Bail to the slowpath if the access might touch multiple cache lines.
-  // An access aligned to its size is guaranteed to be intra-cache-line.
-  // getMemoryAccessFuncIndex has already ruled out a size larger than 16
-  // and thus larger than a cache line for platforms this tool targets
-  // (and our shadow memory setup assumes 64-byte cache lines).
-  assert(TypeSize <= 128);
-  if (!(TypeSize == 8 ||
-        (Alignment % (TypeSize / 8)) == 0)) {
-    if (ClAssumeIntraCacheLine)
-      ++NumAssumedIntraCacheLine;
-    else
-      return false;
-  }
-
-  // We inline instrumentation to set the corresponding shadow bits for
-  // each cache line touched by the application.  Here we handle a single
-  // load or store where we've already ruled out the possibility that it
-  // might touch more than one cache line and thus we simply update the
-  // shadow memory for a single cache line.
-  // Our shadow memory model is fine with races when manipulating shadow values.
-  // We generate the following code:
-  //
-  //   const char BitMask = 0x81;
-  //   char *ShadowAddr = appToShadow(AppAddr);
-  //   if ((*ShadowAddr & BitMask) != BitMask)
-  //     *ShadowAddr |= Bitmask;
-  //
-  Value *AddrPtr = IRB.CreatePointerCast(Addr, IntptrTy);
-  Value *ShadowPtr = appToShadow(AddrPtr, IRB);
-  Type *ShadowTy = IntegerType::get(*Ctx, 8U);
-  Type *ShadowPtrTy = PointerType::get(ShadowTy, 0);
-  // The bottom bit is used for the current sampling period's working set.
-  // The top bit is used for the total working set.  We set both on each
-  // memory access, if they are not already set.
-  Value *ValueMask = ConstantInt::get(ShadowTy, 0x81); // 10000001B
-
-  Value *OldValue = IRB.CreateLoad(IRB.CreateIntToPtr(ShadowPtr, ShadowPtrTy));
-  // The AND and CMP will be turned into a TEST instruction by the compiler.
-  Value *Cmp = IRB.CreateICmpNE(IRB.CreateAnd(OldValue, ValueMask), ValueMask);
-  TerminatorInst *CmpTerm = SplitBlockAndInsertIfThen(Cmp, I, false);
-  // FIXME: do I need to call SetCurrentDebugLocation?
-  IRB.SetInsertPoint(CmpTerm);
-  // We use OR to set the shadow bits to avoid corrupting the middle 6 bits,
-  // which are used by the runtime library.
-  Value *NewVal = IRB.CreateOr(OldValue, ValueMask);
-  IRB.CreateStore(NewVal, IRB.CreateIntToPtr(ShadowPtr, ShadowPtrTy));
-  IRB.SetInsertPoint(I);
-
-  return true;
-}*/
