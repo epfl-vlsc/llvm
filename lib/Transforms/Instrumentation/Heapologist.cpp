@@ -351,19 +351,29 @@ void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
     }
   }
   if (t) {
+    // we can't use isStructTy here because they are all
+    // pointer types
     std::string type_name;
     llvm::raw_string_ostream rso(type_name);
-    if (t->isStructTy())
-      type_name = t->getStructName();
-    else {
-      t->print(rso);
-      type_name = rso.str();
+    t->print(rso);
+    type_name = rso.str();
+    size_t pos = type_name.find_first_of('.');
+    if (pos != std::string::npos)
+      type_name = type_name.substr(pos+1);
+    // remove extraneous `"` sometimes added by LLVM
+    type_name.erase(std::remove(type_name.begin(), type_name.end(), '\"'), type_name.end());
+    if (diloc->getFilename()[0] == '/') {
+      type_file << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << diloc->getColumn() << "|" << type_name << "\n";
+    } else {
+      type_file << diloc->getDirectory().str() << "/" << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << diloc->getColumn() << "|" << type_name << "\n";
     }
-    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << "|" << type_name << "\n";
-
   } else {
     // no cast found means that its basically char*
-    type_file << diloc->getFilename().str() << ":" << diloc->getLine() << "|" << "i8*" << "\n";
+    if (diloc->getFilename()[0] == '/') {
+      type_file << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << diloc->getColumn() << "|" << "i8*" << "\n";
+    } else {
+      type_file << diloc->getDirectory().str() << "/" << diloc->getFilename().str() << ":" << diloc->getLine() << ":" << diloc->getColumn() << "|" << "i8*" << "\n";
+    }
   }
 }
 
@@ -375,9 +385,11 @@ void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
   int     status;
   char   *realname;
   realname = abi::__cxa_demangle(F->getName().str().c_str(), 0, 0, &status);
-  if (F->getName().compare("malloc") == 0 || (realname && strcmp(realname, "operator new[](unsigned long)") == 0)
-          || (realname && strcmp(realname, "operator new(unsigned long)") == 0)){
-    errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
+  if (F->getName().compare("malloc") == 0 || F->getName().compare("realloc") == 0
+      || F->getName().compare("calloc") == 0
+      || (realname && strcmp(realname, "operator new[](unsigned long)") == 0)
+         || (realname && strcmp(realname, "operator new(unsigned long)") == 0)){
+    //errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
     if (realname) {
       StringRef name(realname);
       instrumentMallocNew(CI, name);
