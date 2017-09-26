@@ -280,9 +280,12 @@ bool Heapologist::initOnModule(Module &M) {
 
 
   mkdir("typefiles", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH); // just needs to exist, dont care if it fails
-  SmallString<4096> filename("typefiles/");
-  filename += M.getName().str() + ".types";
-  type_file.open(filename.str(), std::ios::out);
+  SmallString<64> dir("typefiles/");
+  SmallString<4096> filename(M.getName().str() + ".types");
+  // form a unique flattened name
+  std::replace(filename.begin(), filename.end(), '/', '.');
+
+  type_file.open((dir + filename).str(), std::ios::out);
 
   Ctx = &M.getContext();
   const DataLayout &DL = M.getDataLayout();
@@ -377,14 +380,19 @@ void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
   }
 }
 
+// OK technically not instrumenting, should probably change name of this method
 void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
   // saying right now there is probably a better way to do this,
   // like get pointer to alloc functions and compare those?
   // but not sure how to do and this works :-P
   Function *F = CI->getCalledFunction();
+  if (!F) {
+    return;
+  }
   int     status;
   char   *realname;
   realname = abi::__cxa_demangle(F->getName().str().c_str(), 0, 0, &status);
+  //errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
   if (F->getName().compare("malloc") == 0 || F->getName().compare("realloc") == 0
       || F->getName().compare("calloc") == 0
       || (realname && strcmp(realname, "operator new[](unsigned long)") == 0)
