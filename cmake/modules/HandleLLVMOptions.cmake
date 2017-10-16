@@ -247,13 +247,13 @@ if( MSVC )
     # especially so std::equal(nullptr, nullptr, nullptr) will not assert.
     add_llvm_definitions("-D_DEBUG_POINTER_IMPL=")
   endif()
-  
+
   include(ChooseMSVCCRT)
 
   if( MSVC11 )
     add_llvm_definitions(-D_VARIADIC_MAX=10)
   endif()
-  
+
   # Add definitions that make MSVC much less annoying.
   add_llvm_definitions(
     # For some reason MS wants to deprecate a bunch of standard functions...
@@ -335,7 +335,7 @@ if( MSVC )
     # clang-cl having /W4 after the -we flags will re-enable the warnings
     # disabled by -we.
     set(msvc_warning_flags "/W4 ${msvc_warning_flags}")
-    # CMake appends /W3 by default, and having /W3 followed by /W4 will result in 
+    # CMake appends /W3 by default, and having /W3 followed by /W4 will result in
     # cl : Command line warning D9025 : overriding '/W3' with '/W4'.  Since this is
     # a command line warning and not a compiler warning, it cannot be suppressed except
     # by fixing the command line.
@@ -391,7 +391,7 @@ if( MSVC )
 
       string(FIND "${upper_exe_flags} ${upper_module_flags} ${upper_shared_flags}"
         "/INCREMENTAL" linker_flag_idx)
-      
+
       if (${linker_flag_idx} GREATER -1)
         message(WARNING "/Brepro not compatible with /INCREMENTAL linking - builds will be non-deterministic")
       else()
@@ -565,6 +565,9 @@ if(LLVM_USE_SANITIZER)
       append_common_sanitizer_flags()
       append("-fsanitize=address,undefined -fno-sanitize=vptr,function -fno-sanitize-recover=all"
               CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+    elseif (LLVM_USE_SANITIZER STREQUAL "Heapologist")
+      append_common_sanitizer_flags()
+      append("-fsanitize=heapologist" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
     else()
       message(FATAL_ERROR "Unsupported value of LLVM_USE_SANITIZER: ${LLVM_USE_SANITIZER}")
     endif()

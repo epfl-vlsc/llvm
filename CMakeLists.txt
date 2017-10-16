@@ -84,7 +84,7 @@ if(CMAKE_HOST_APPLE AND APPLE)
         set(LIBTOOL_NO_WARNING_FLAG "-no_warning_for_no_symbols")
       endif()
     endif()
-    
+
     foreach(lang ${languages})
       set(CMAKE_${lang}_CREATE_STATIC_LIBRARY
         "${CMAKE_LIBTOOL} -static ${LIBTOOL_NO_WARNING_FLAG} -o <TARGET> \
@@ -445,7 +445,7 @@ if( LLVM_USE_OPROFILE )
   endif( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
 endif( LLVM_USE_OPROFILE )
 
-set(LLVM_USE_SANITIZER "" CACHE STRING
+set(LLVM_USE_SANITIZER "Heapologist" CACHE STRING
   "Define the sanitizer used to build binaries and tests.")
 
 option(LLVM_USE_SPLIT_DWARF
