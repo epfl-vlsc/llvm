@@ -64,7 +64,8 @@ tools/avrlit
 docs/_build
 # VSCode config files.
 .vscode
-
+# Cmake build dir.
+cmake-build-*
 #==============================================================================#
 # Files created in tree by the Go bindings.
 #==============================================================================#
