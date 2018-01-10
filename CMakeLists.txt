@@ -445,7 +445,7 @@ if( LLVM_USE_OPROFILE )
   endif( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
 endif( LLVM_USE_OPROFILE )
 
-set(LLVM_USE_SANITIZER "Heapologist" CACHE STRING
+set(LLVM_USE_SANITIZER "" CACHE STRING
   "Define the sanitizer used to build binaries and tests.")
 
 option(LLVM_USE_SPLIT_DWARF

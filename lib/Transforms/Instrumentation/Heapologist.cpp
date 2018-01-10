@@ -40,6 +40,8 @@
 #include <sys/stat.h>
 #include <cxxabi.h>
 #include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 
 using namespace llvm;
 
@@ -128,9 +130,7 @@ public:
       const HeapologistOptions &Opts = HeapologistOptions())
       : ModulePass(ID), Options(OverrideOptionsFromCL(Opts)) {
   }
-  ~Heapologist() {
-    type_file.close();
-  }
+  ~Heapologist() {}
   StringRef getPassName() const override;
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   bool runOnModule(Module &M) override;
@@ -141,13 +141,13 @@ private:
   void initializeCallbacks(Module &M);
   Constant *createHplgstInitToolInfoArg(Module &M, const DataLayout &DL);
   void createDestructor(Module &M, Constant *ToolInfoArg);
-  bool runOnFunction(Function &F, Module &M);
+  bool runOnFunction(Function &F, Module &M, raw_fd_ostream& type_file);
   bool instrumentLoadOrStore(Instruction *I, const DataLayout &DL);
   bool instrumentMemIntrinsic(MemIntrinsic *MI);
   bool shouldIgnoreMemoryAccess(Instruction *I);
   int getMemoryAccessFuncIndex(Value *Addr, const DataLayout &DL);
-  void maybeInstrumentMallocNew(CallInst *CI);
-  void instrumentMallocNew(CallInst *CI, StringRef const& name);
+  void maybeInstrumentMallocNew(CallInst *CI, raw_fd_ostream& type_file);
+  void instrumentMallocNew(CallInst *CI, StringRef const& name, raw_fd_ostream& type_file);
 
   HeapologistOptions Options;
   LLVMContext *Ctx;
@@ -165,7 +165,8 @@ private:
   Function *HplgstCtorFunction;
   Function *HplgstDtorFunction;
   // file we will dump alloc point type info to
-  std::ofstream type_file;
+  //std::ofstream type_file;
+  //raw_fd_ostream type_file;
 };
 } // namespace
 
@@ -279,14 +280,6 @@ void Heapologist::createDestructor(Module &M, Constant *ToolInfoArg) {
 bool Heapologist::initOnModule(Module &M) {
 
 
-  mkdir("typefiles", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH); // just needs to exist, dont care if it fails
-  SmallString<64> dir("typefiles/");
-  SmallString<4096> filename(M.getName().str() + ".types");
-  // form a unique flattened name
-  std::replace(filename.begin(), filename.end(), '/', '.');
-
-  type_file.open((dir + filename).str(), std::ios::out);
-
   Ctx = &M.getContext();
   const DataLayout &DL = M.getDataLayout();
   IRBuilder<> IRB(M.getContext());
@@ -332,17 +325,51 @@ bool Heapologist::shouldIgnoreMemoryAccess(Instruction *I) {
 }
 
 bool Heapologist::runOnModule(Module &M) {
+  // TODO use a temp dir in users home or something, because this creates a bunch of different dirs
+  SmallString<64> dir("typefiles");
+  sys::fs::create_directory(dir);
+  //mkdir("typefiles", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH); // just needs to exist, dont care if it fails
+  SmallString<4096> filename(M.getName().str() + ".types");
+  // form a unique flattened name
+  std::replace(filename.begin(), filename.end(), sys::path::get_separator()[0], '.');
+
+  std::error_code EC;
+  raw_fd_ostream type_file((dir+ sys::path::get_separator() + filename).str(), EC, sys::fs::F_Text);
+
   bool Res = initOnModule(M);
   initializeCallbacks(M);
   for (auto &F : M) {
-    Res |= runOnFunction(F, M);
+    Res |= runOnFunction(F, M, type_file);
   }
   return Res;
 }
 
-void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
+static void printDebugLoc(const DebugLoc &DL, raw_ostream &CommentOS,
+                          const LLVMContext &Ctx) {
+  if (!DL)
+    return;
+
+  auto *Scope = cast<DIScope>(DL.getScope());
+// Omit the directory, because it's likely to be long and uninteresting.
+  CommentOS << Scope->getFilename();
+  CommentOS << ':' << DL.getLine();
+  if (DL.getCol() != 0)
+    CommentOS << ':' << DL.getCol();
+
+  DebugLoc InlinedAtDL = DL.getInlinedAt();
+  if (!InlinedAtDL)
+    return;
+
+  CommentOS << " @[ ";
+  printDebugLoc(InlinedAtDL, CommentOS, Ctx);
+  CommentOS << " ]";
+}
+
+void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name, raw_fd_ostream& type_file) {
 
   auto& loc = CI->getDebugLoc();
+  //printDebugLoc(loc, errs(), CI->getContext());
+  //errs() << "\n";
   auto* diloc = loc.get();
   Type* t = nullptr;
   for (auto it = CI->user_begin(); it != CI->user_end(); it++) {
@@ -381,12 +408,12 @@ void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name) {
 }
 
 // OK technically not instrumenting, should probably change name of this method
-void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
+void Heapologist::maybeInstrumentMallocNew(CallInst *CI, raw_fd_ostream& type_file) {
   // saying right now there is probably a better way to do this,
   // like get pointer to alloc functions and compare those?
   // but not sure how to do and this works :-P
   Function *F = CI->getCalledFunction();
-  if (!F) {
+  if (!F || F->getName().size() == 0) {
     return;
   }
   int     status;
@@ -400,15 +427,15 @@ void Heapologist::maybeInstrumentMallocNew(CallInst *CI) {
     //errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
     if (realname) {
       StringRef name(realname);
-      instrumentMallocNew(CI, name);
+      instrumentMallocNew(CI, name, type_file);
     } else {
-      instrumentMallocNew(CI, F->getName());
+      instrumentMallocNew(CI, F->getName(), type_file);
     }
   }
   free(realname);
 }
 
-bool Heapologist::runOnFunction(Function &F, Module &M) {
+bool Heapologist::runOnFunction(Function &F, Module &M, raw_fd_ostream& type_file) {
   // This is required to prevent instrumenting the call to __hplgst_init from
   // within the module constructor.
   //errs() << "running heapologist instrumenter on function!\n";
@@ -434,7 +461,7 @@ bool Heapologist::runOnFunction(Function &F, Module &M) {
         GetElementPtrs.push_back(&Inst);
       else if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
         maybeMarkSanitizerLibraryCallNoBuiltin(CI, TLI);
-        maybeInstrumentMallocNew(CI);
+        maybeInstrumentMallocNew(CI, type_file);
       }
     }
   }
@@ -464,18 +491,30 @@ bool Heapologist::instrumentLoadOrStore(Instruction *I,
     IsStore = false;
     Alignment = Load->getAlignment();
     Addr = Load->getPointerOperand();
+    if (isa<AllocaInst>(Addr)) {
+      return true;
+    }
   } else if (StoreInst *Store = dyn_cast<StoreInst>(I)) {
     IsStore = true;
     Alignment = Store->getAlignment();
     Addr = Store->getPointerOperand();
+    if (isa<AllocaInst>(Addr)) {
+      return true;
+    }
   } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
     IsStore = true;
     Alignment = 0;
     Addr = RMW->getPointerOperand();
+    if (isa<AllocaInst>(Addr)) {
+      return true;
+    }
   } else if (AtomicCmpXchgInst *Xchg = dyn_cast<AtomicCmpXchgInst>(I)) {
     IsStore = true;
     Alignment = 0;
     Addr = Xchg->getPointerOperand();
+    if (isa<AllocaInst>(Addr)) {
+      return true;
+    }
   } else
     llvm_unreachable("Unsupported mem access type");
 
