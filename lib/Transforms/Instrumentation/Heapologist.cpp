@@ -368,9 +368,11 @@ static void printDebugLoc(const DebugLoc &DL, raw_ostream &CommentOS,
 void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name, raw_fd_ostream& type_file) {
 
   auto& loc = CI->getDebugLoc();
-  //printDebugLoc(loc, errs(), CI->getContext());
-  //errs() << "\n";
   auto* diloc = loc.get();
+
+  // if no debug info, cannot output
+  if (!diloc) return;
+
   Type* t = nullptr;
   for (auto it = CI->user_begin(); it != CI->user_end(); it++) {
     if (isa<CastInst>(*it)) {
