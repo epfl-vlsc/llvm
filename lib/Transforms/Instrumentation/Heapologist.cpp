@@ -78,6 +78,7 @@ static cl::opt<bool> ClAuxFieldInfo(
 
 STATISTIC(NumInstrumentedLoads, "Number of instrumented loads");
 STATISTIC(NumInstrumentedStores, "Number of instrumented stores");
+STATISTIC(NumInstructions, "Number of instructions");
 STATISTIC(NumFastpaths, "Number of instrumented fastpaths");
 STATISTIC(NumAccessesWithIrregularSize,
           "Number of accesses with a size outside our targeted callout sizes");
@@ -485,6 +486,7 @@ bool Heapologist::runOnFunction(Function &F, Module &M, raw_fd_ostream& type_fil
 
 bool Heapologist::instrumentLoadOrStore(Instruction *I,
                                                 const DataLayout &DL) {
+  NumInstructions++;
   IRBuilder<> IRB(I);
   bool IsStore;
   Value *Addr;
