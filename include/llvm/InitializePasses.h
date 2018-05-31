@@ -125,7 +125,7 @@ void initializeEarlyCSEMemSSALegacyPassPass(PassRegistry &);
 void initializeEarlyIfConverterPass(PassRegistry&);
 void initializeEdgeBundlesPass(PassRegistry&);
 void initializeEfficiencySanitizerPass(PassRegistry&);
-  void initializeHeapologistPass(PassRegistry&);
+void initializeMemoroPass(PassRegistry&);
 void initializeEliminateAvailableExternallyLegacyPassPass(PassRegistry &);
 void initializeRAGreedyPass(PassRegistry&);
 void initializeGVNHoistLegacyPassPass(PassRegistry &);

@@ -1,4 +1,4 @@
-//===-- Heapologist.cpp ---------------------------------------------------===//
+//===-- Memoro.cpp ---------------------------------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file is a part of Heapologist, a tool to detect inefficient heap
+// This file is a part of Memoro, a tool to detect inefficient heap
 // usage patterns. This file was adapted from the EfficiencySanitizer
 // instrumentation.
 //
@@ -45,20 +45,20 @@
 
 using namespace llvm;
 
-#define DEBUG_TYPE "hplgst"
+#define DEBUG_TYPE "memoro"
 
 // The tool type must be just one of these ClTool* options, as the tools
 // cannot be combined due to shadow memory constraints.
 
 // Each new tool will get its own opt flag here.
-// These are converted to HeapologistOptions for use
+// These are converted to MemoroOptions for use
 // in the code.
 
 static cl::opt<bool> ClInstrumentLoadsAndStores(
-    "hplgst-instrument-loads-and-stores", cl::init(true),
+    "memoro-instrument-loads-and-stores", cl::init(true),
     cl::desc("Instrument loads and stores"), cl::Hidden);
 static cl::opt<bool> ClInstrumentMemIntrinsics(
-    "hplgst-instrument-memintrinsics", cl::init(true),
+    "memoro-instrument-memintrinsics", cl::init(true),
     cl::desc("Instrument memintrinsics (memset/memcpy/memmove)"), cl::Hidden);
 /*static cl::opt<bool> ClInstrumentFastpath(
     "esan-instrument-fastpath", cl::init(true),
@@ -88,21 +88,21 @@ STATISTIC(NumInstrumentedGEPs, "Number of instrumented GEP instructions");
 STATISTIC(NumAssumedIntraCacheLine,
           "Number of accesses assumed to be intra-cache-line");
 
-static const uint64_t HplgstCtorAndDtorPriority = 0;
-static const char *const HplgstModuleCtorName = "hplgst.module_ctor";
-static const char *const HplgstModuleDtorName = "hplgst.module_dtor";
-static const char *const HplgstInitName = "__hplgst_init";
-static const char *const HplgstExitName = "__hplgst_exit";
+static const uint64_t MemoroCtorAndDtorPriority = 0;
+static const char *const MemoroModuleCtorName = "memoro.module_ctor";
+static const char *const MemoroModuleDtorName = "memoro.module_dtor";
+static const char *const MemoroInitName = "__memoro_init";
+static const char *const MemoroExitName = "__memoro_exit";
 
 // We need to specify the tool to the runtime earlier than
 // the ctor is called in some cases, so we set a global variable.
-static const char *const HplgstWhichToolName = "__hplgst_which_tool";
+static const char *const MemoroWhichToolName = "__memoro_which_tool";
 
 
 namespace {
 
-static HeapologistOptions
-OverrideOptionsFromCL(HeapologistOptions Options) {
+static MemoroOptions
+OverrideOptionsFromCL(MemoroOptions Options) {
 
   // no options ... yet
 
@@ -124,14 +124,14 @@ static GlobalVariable *createPrivateGlobalForString(Module &M, StringRef Str,
   return GV;
 }
 
-/// Heapologist: instrument each module to find performance issues.
-class Heapologist : public ModulePass {
+/// Memoro: instrument each module to find performance issues.
+class Memoro : public ModulePass {
 public:
-  Heapologist(
-      const HeapologistOptions &Opts = HeapologistOptions())
+  Memoro(
+      const MemoroOptions &Opts = MemoroOptions())
       : ModulePass(ID), Options(OverrideOptionsFromCL(Opts)) {
   }
-  ~Heapologist() {}
+  ~Memoro() {}
   StringRef getPassName() const override;
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   bool runOnModule(Module &M) override;
@@ -140,7 +140,7 @@ public:
 private:
   bool initOnModule(Module &M);
   void initializeCallbacks(Module &M);
-  Constant *createHplgstInitToolInfoArg(Module &M, const DataLayout &DL);
+  Constant *createMemoroInitToolInfoArg(Module &M, const DataLayout &DL);
   void createDestructor(Module &M, Constant *ToolInfoArg);
   bool runOnFunction(Function &F, Module &M, raw_fd_ostream& type_file);
   bool instrumentLoadOrStore(Instruction *I, const DataLayout &DL);
@@ -150,50 +150,50 @@ private:
   void maybeInstrumentMallocNew(CallInst *CI, raw_fd_ostream& type_file);
   void instrumentMallocNew(CallInst *CI, StringRef const& name, raw_fd_ostream& type_file);
 
-  HeapologistOptions Options;
+  MemoroOptions Options;
   LLVMContext *Ctx;
   Type *IntptrTy;
   // Our slowpath involves callouts to the runtime library.
   // Access sizes are powers of two: 1, 2, 4, 8, 16.
   static const size_t NumberOfAccessSizes = 5;
-  Function *HplgstAlignedLoad[NumberOfAccessSizes];
-  Function *HplgstAlignedStore[NumberOfAccessSizes];
-  Function *HplgstUnalignedLoad[NumberOfAccessSizes];
-  Function *HplgstUnalignedStore[NumberOfAccessSizes];
+  Function *MemoroAlignedLoad[NumberOfAccessSizes];
+  Function *MemoroAlignedStore[NumberOfAccessSizes];
+  Function *MemoroUnalignedLoad[NumberOfAccessSizes];
+  Function *MemoroUnalignedStore[NumberOfAccessSizes];
   // For irregular sizes of any alignment:
-  Function *HplgstUnalignedLoadN, *HplgstUnalignedStoreN;
+  Function *MemoroUnalignedLoadN, *MemoroUnalignedStoreN;
   Function *MemmoveFn, *MemcpyFn, *MemsetFn;
-  Function *HplgstCtorFunction;
-  Function *HplgstDtorFunction;
+  Function *MemoroCtorFunction;
+  Function *MemoroDtorFunction;
   // file we will dump alloc point type info to
   //std::ofstream type_file;
   //raw_fd_ostream type_file;
 };
 } // namespace
 
-char Heapologist::ID = 0;
+char Memoro::ID = 0;
 INITIALIZE_PASS_BEGIN(
-    Heapologist, "hplgst",
-    "Heapologist: finds heap performance issues.", false, false)
+    Memoro, "memoro",
+    "Memoro: finds heap performance issues.", false, false)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
 INITIALIZE_PASS_END(
-    Heapologist, "hplgst",
-    "Heapologist: finds heap performance issues.", false, false)
+    Memoro, "memoro",
+    "Memoro: finds heap performance issues.", false, false)
 
-StringRef Heapologist::getPassName() const {
-  return "Heapologist";
+StringRef Memoro::getPassName() const {
+  return "Memoro";
 }
 
-void Heapologist::getAnalysisUsage(AnalysisUsage &AU) const {
+void Memoro::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<TargetLibraryInfoWrapperPass>();
 }
 
 ModulePass *
-llvm::createHeapologistPass(const HeapologistOptions &Options) {
-  return new Heapologist(Options);
+llvm::createMemoroPass(const MemoroOptions &Options) {
+  return new Memoro(Options);
 }
 
-void Heapologist::initializeCallbacks(Module &M) {
+void Memoro::initializeCallbacks(Module &M) {
   IRBuilder<> IRB(M.getContext());
   // Initialize the callbacks.
   for (size_t Idx = 0; Idx < NumberOfAccessSizes; ++Idx) {
@@ -201,28 +201,28 @@ void Heapologist::initializeCallbacks(Module &M) {
     std::string ByteSizeStr = utostr(ByteSize);
     // We'll inline the most common (i.e., aligned and frequent sizes)
     // load + store instrumentation: these callouts are for the slowpath.
-    SmallString<32> AlignedLoadName("__hplgst_aligned_load" + ByteSizeStr);
-    HplgstAlignedLoad[Idx] =
+    SmallString<32> AlignedLoadName("__memoro_aligned_load" + ByteSizeStr);
+    MemoroAlignedLoad[Idx] =
         checkSanitizerInterfaceFunction(M.getOrInsertFunction(
             AlignedLoadName, IRB.getVoidTy(), IRB.getInt8PtrTy(), nullptr));
-    SmallString<32> AlignedStoreName("__hplgst_aligned_store" + ByteSizeStr);
-    HplgstAlignedStore[Idx] =
+    SmallString<32> AlignedStoreName("__memoro_aligned_store" + ByteSizeStr);
+    MemoroAlignedStore[Idx] =
         checkSanitizerInterfaceFunction(M.getOrInsertFunction(
             AlignedStoreName, IRB.getVoidTy(), IRB.getInt8PtrTy(), nullptr));
-    SmallString<32> UnalignedLoadName("__hplgst_unaligned_load" + ByteSizeStr);
-    HplgstUnalignedLoad[Idx] =
+    SmallString<32> UnalignedLoadName("__memoro_unaligned_load" + ByteSizeStr);
+    MemoroUnalignedLoad[Idx] =
         checkSanitizerInterfaceFunction(M.getOrInsertFunction(
             UnalignedLoadName, IRB.getVoidTy(), IRB.getInt8PtrTy(), nullptr));
-    SmallString<32> UnalignedStoreName("__hplgst_unaligned_store" + ByteSizeStr);
-    HplgstUnalignedStore[Idx] =
+    SmallString<32> UnalignedStoreName("__memoro_unaligned_store" + ByteSizeStr);
+    MemoroUnalignedStore[Idx] =
         checkSanitizerInterfaceFunction(M.getOrInsertFunction(
             UnalignedStoreName, IRB.getVoidTy(), IRB.getInt8PtrTy(), nullptr));
   }
-  HplgstUnalignedLoadN = checkSanitizerInterfaceFunction(
-      M.getOrInsertFunction("__hplgst_unaligned_loadN", IRB.getVoidTy(),
+  MemoroUnalignedLoadN = checkSanitizerInterfaceFunction(
+      M.getOrInsertFunction("__memoro_unaligned_loadN", IRB.getVoidTy(),
                             IRB.getInt8PtrTy(), IntptrTy, nullptr));
-  HplgstUnalignedStoreN = checkSanitizerInterfaceFunction(
-      M.getOrInsertFunction("__hplgst_unaligned_storeN", IRB.getVoidTy(),
+  MemoroUnalignedStoreN = checkSanitizerInterfaceFunction(
+      M.getOrInsertFunction("__memoro_unaligned_storeN", IRB.getVoidTy(),
                             IRB.getInt8PtrTy(), IntptrTy, nullptr));
   MemmoveFn = checkSanitizerInterfaceFunction(
       M.getOrInsertFunction("memmove", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
@@ -240,9 +240,9 @@ void Heapologist::initializeCallbacks(Module &M) {
 // offset, and type name) for better user report.
 
 
-// Create the tool-specific argument passed to HplgstInit and HplgstExit.
+// Create the tool-specific argument passed to MemoroInit and MemoroExit.
 // TODO can probably get rid of this,
-Constant *Heapologist::createHplgstInitToolInfoArg(Module &M,
+Constant *Memoro::createMemoroInitToolInfoArg(Module &M,
                                                          const DataLayout &DL) {
   // This structure contains tool-specific information about each compilation
   // unit (module) and is passed to the runtime library.
@@ -262,23 +262,23 @@ Constant *Heapologist::createHplgstInitToolInfoArg(Module &M,
   return ConstantPointerNull::get(Int8PtrTy);
 }
 
-void Heapologist::createDestructor(Module &M, Constant *ToolInfoArg) {
+void Memoro::createDestructor(Module &M, Constant *ToolInfoArg) {
   PointerType *Int8PtrTy = Type::getInt8PtrTy(*Ctx);
-  HplgstDtorFunction = Function::Create(FunctionType::get(Type::getVoidTy(*Ctx),
+  MemoroDtorFunction = Function::Create(FunctionType::get(Type::getVoidTy(*Ctx),
                                                         false),
                                       GlobalValue::InternalLinkage,
-                                      HplgstModuleDtorName, &M);
-  ReturnInst::Create(*Ctx, BasicBlock::Create(*Ctx, "", HplgstDtorFunction));
-  IRBuilder<> IRB_Dtor(HplgstDtorFunction->getEntryBlock().getTerminator());
-  Function *HplgstExit = checkSanitizerInterfaceFunction(
-      M.getOrInsertFunction(HplgstExitName, IRB_Dtor.getVoidTy(),
+                                      MemoroModuleDtorName, &M);
+  ReturnInst::Create(*Ctx, BasicBlock::Create(*Ctx, "", MemoroDtorFunction));
+  IRBuilder<> IRB_Dtor(MemoroDtorFunction->getEntryBlock().getTerminator());
+  Function *MemoroExit = checkSanitizerInterfaceFunction(
+      M.getOrInsertFunction(MemoroExitName, IRB_Dtor.getVoidTy(),
                             Int8PtrTy, nullptr));
-  HplgstExit->setLinkage(Function::ExternalLinkage);
-  IRB_Dtor.CreateCall(HplgstExit, {ToolInfoArg});
-  appendToGlobalDtors(M, HplgstDtorFunction, HplgstCtorAndDtorPriority);
+  MemoroExit->setLinkage(Function::ExternalLinkage);
+  IRB_Dtor.CreateCall(MemoroExit, {ToolInfoArg});
+  appendToGlobalDtors(M, MemoroDtorFunction, MemoroCtorAndDtorPriority);
 }
 
-bool Heapologist::initOnModule(Module &M) {
+bool Memoro::initOnModule(Module &M) {
 
 
   Ctx = &M.getContext();
@@ -287,17 +287,17 @@ bool Heapologist::initOnModule(Module &M) {
   IntegerType *OrdTy = IRB.getInt32Ty();
   PointerType *Int8PtrTy = Type::getInt8PtrTy(*Ctx);
   IntptrTy = DL.getIntPtrType(M.getContext());
-  // Create the variable passed to HplgstInit and HplgstExit.
-  Constant *ToolInfoArg = createHplgstInitToolInfoArg(M, DL);
+  // Create the variable passed to MemoroInit and MemoroExit.
+  Constant *ToolInfoArg = createMemoroInitToolInfoArg(M, DL);
   // Constructor
-  // We specify the tool type both in the HplgstWhichToolName global
+  // We specify the tool type both in the MemoroWhichToolName global
   // and as an arg to the init routine as a sanity check.
-  std::tie(HplgstCtorFunction, std::ignore) = createSanitizerCtorAndInitFunctions(
-      M, HplgstModuleCtorName, HplgstInitName, /*InitArgTypes=*/{OrdTy, Int8PtrTy},
+  std::tie(MemoroCtorFunction, std::ignore) = createSanitizerCtorAndInitFunctions(
+      M, MemoroModuleCtorName, MemoroInitName, /*InitArgTypes=*/{OrdTy, Int8PtrTy},
       /*InitArgs=*/{
         ConstantInt::get(OrdTy, static_cast<int>(Options.test_op)),
         ToolInfoArg});
-  appendToGlobalCtors(M, HplgstCtorFunction, HplgstCtorAndDtorPriority);
+  appendToGlobalCtors(M, MemoroCtorFunction, MemoroCtorAndDtorPriority);
 
   createDestructor(M, ToolInfoArg);
 
@@ -305,18 +305,18 @@ bool Heapologist::initOnModule(Module &M) {
                      GlobalValue::WeakAnyLinkage,
                      ConstantInt::get(OrdTy,
                                       static_cast<int>(Options.test_op)),
-                     HplgstWhichToolName);
+                     MemoroWhichToolName);
 
   return true;
 }
 
 
-bool Heapologist::shouldIgnoreMemoryAccess(Instruction *I) {
-  /*if (Options.ToolType == HeapologistOptions::ESAN_CacheFrag) {
+bool Memoro::shouldIgnoreMemoryAccess(Instruction *I) {
+  /*if (Options.ToolType == MemoroOptions::ESAN_CacheFrag) {
     // We'd like to know about cache fragmentation in vtable accesses and
     // constant data references, so we do not currently ignore anything.
     return false;
-  } else if (Options.ToolType == HeapologistOptions::ESAN_WorkingSet) {
+  } else if (Options.ToolType == MemoroOptions::ESAN_WorkingSet) {
     // TODO: the instrumentation disturbs the data layout on the stack, so we
     // may want to add an option to ignore stack references (if we can
     // distinguish them) to reduce overhead.
@@ -325,7 +325,7 @@ bool Heapologist::shouldIgnoreMemoryAccess(Instruction *I) {
   return false;
 }
 
-bool Heapologist::runOnModule(Module &M) {
+bool Memoro::runOnModule(Module &M) {
   // TODO use a temp dir in users home or something, because this creates a bunch of different dirs
   SmallString<64> dir("typefiles");
   sys::fs::create_directory(dir);
@@ -366,7 +366,7 @@ static void printDebugLoc(const DebugLoc &DL, raw_ostream &CommentOS,
   CommentOS << " ]";
 }
 
-void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name, raw_fd_ostream& type_file) {
+void Memoro::instrumentMallocNew(CallInst *CI, StringRef const& name, raw_fd_ostream& type_file) {
 
   auto& loc = CI->getDebugLoc();
   auto* diloc = loc.get();
@@ -411,7 +411,7 @@ void Heapologist::instrumentMallocNew(CallInst *CI, StringRef const& name, raw_f
 }
 
 // OK technically not instrumenting, should probably change name of this method
-void Heapologist::maybeInstrumentMallocNew(CallInst *CI, raw_fd_ostream& type_file) {
+void Memoro::maybeInstrumentMallocNew(CallInst *CI, raw_fd_ostream& type_file) {
   // saying right now there is probably a better way to do this,
   // like get pointer to alloc functions and compare those?
   // but not sure how to do and this works :-P
@@ -422,12 +422,12 @@ void Heapologist::maybeInstrumentMallocNew(CallInst *CI, raw_fd_ostream& type_fi
   int     status;
   char   *realname;
   realname = abi::__cxa_demangle(F->getName().str().c_str(), 0, 0, &status);
-  //errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
+  //errs() << "memoro found function named " << F->getName() << " with demangled name " << realname << "\n";
   if (F->getName().compare("malloc") == 0 || F->getName().compare("realloc") == 0
       || F->getName().compare("calloc") == 0
       || (realname && strcmp(realname, "operator new[](unsigned long)") == 0)
          || (realname && strcmp(realname, "operator new(unsigned long)") == 0)){
-    //errs() << "hplgst found function named " << F->getName() << " with demangled name " << realname << "\n";
+    //errs() << "memoro found function named " << F->getName() << " with demangled name " << realname << "\n";
     if (realname) {
       StringRef name(realname);
       instrumentMallocNew(CI, name, type_file);
@@ -438,11 +438,11 @@ void Heapologist::maybeInstrumentMallocNew(CallInst *CI, raw_fd_ostream& type_fi
   free(realname);
 }
 
-bool Heapologist::runOnFunction(Function &F, Module &M, raw_fd_ostream& type_file) {
-  // This is required to prevent instrumenting the call to __hplgst_init from
+bool Memoro::runOnFunction(Function &F, Module &M, raw_fd_ostream& type_file) {
+  // This is required to prevent instrumenting the call to __memoro_init from
   // within the module constructor.
-  //errs() << "running heapologist instrumenter on function!\n";
-  if (&F == HplgstCtorFunction)
+  //errs() << "running memoro instrumenter on function!\n";
+  if (&F == MemoroCtorFunction)
     return false;
   SmallVector<Instruction *, 8> LoadsAndStores;
   SmallVector<Instruction *, 8> MemIntrinCalls;
@@ -484,7 +484,7 @@ bool Heapologist::runOnFunction(Function &F, Module &M, raw_fd_ostream& type_fil
   return Res;
 }
 
-bool Heapologist::instrumentLoadOrStore(Instruction *I,
+bool Memoro::instrumentLoadOrStore(Instruction *I,
                                                 const DataLayout &DL) {
   NumInstructions++;
   IRBuilder<> IRB(I);
@@ -536,15 +536,15 @@ bool Heapologist::instrumentLoadOrStore(Instruction *I,
     NumInstrumentedLoads++;
   int Idx = getMemoryAccessFuncIndex(Addr, DL);
   if (Idx < 0) {
-    OnAccessFunc = IsStore ? HplgstUnalignedStoreN : HplgstUnalignedLoadN;
+    OnAccessFunc = IsStore ? MemoroUnalignedStoreN : MemoroUnalignedLoadN;
     IRB.CreateCall(OnAccessFunc,
                    {IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()),
                     ConstantInt::get(IntptrTy, TypeSizeBytes)});
   } else {
     if (Alignment == 0 || (Alignment % TypeSizeBytes) == 0)
-      OnAccessFunc = IsStore ? HplgstAlignedStore[Idx] : HplgstAlignedLoad[Idx];
+      OnAccessFunc = IsStore ? MemoroAlignedStore[Idx] : MemoroAlignedLoad[Idx];
     else
-      OnAccessFunc = IsStore ? HplgstUnalignedStore[Idx] : HplgstUnalignedLoad[Idx];
+      OnAccessFunc = IsStore ? MemoroUnalignedStore[Idx] : MemoroUnalignedLoad[Idx];
     IRB.CreateCall(OnAccessFunc,
                    IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()));
   }
@@ -554,7 +554,7 @@ bool Heapologist::instrumentLoadOrStore(Instruction *I,
 // It's simplest to replace the memset/memmove/memcpy intrinsics with
 // calls that the runtime library intercepts.
 // Our pass is late enough that calls should not turn back into intrinsics.
-bool Heapologist::instrumentMemIntrinsic(MemIntrinsic *MI) {
+bool Memoro::instrumentMemIntrinsic(MemIntrinsic *MI) {
   IRBuilder<> IRB(MI);
   bool Res = false;
   if (isa<MemSetInst>(MI)) {
@@ -580,7 +580,7 @@ bool Heapologist::instrumentMemIntrinsic(MemIntrinsic *MI) {
 
 
 
-int Heapologist::getMemoryAccessFuncIndex(Value *Addr,
+int Memoro::getMemoryAccessFuncIndex(Value *Addr,
                                                   const DataLayout &DL) {
   Type *OrigPtrTy = Addr->getType();
   Type *OrigTy = cast<PointerType>(OrigPtrTy)->getElementType();
