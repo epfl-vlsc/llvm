@@ -1,3 +1,6 @@
+This is a fork of LLVM for development of [Memoro](https://github.com/epfl-vlsc/memoro) static instrumentation. 
+
+
 Low Level Virtual Machine (LLVM)
 ================================
 
