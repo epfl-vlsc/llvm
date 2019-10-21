@@ -25,6 +25,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -376,32 +377,25 @@ bool Memoro::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
     IsStore = false;
     Alignment = Load->getAlignment();
     Addr = Load->getPointerOperand();
-    if (isa<AllocaInst>(Addr)) {
-      return true;
-    }
   } else if (StoreInst *Store = dyn_cast<StoreInst>(I)) {
     IsStore = true;
     Alignment = Store->getAlignment();
     Addr = Store->getPointerOperand();
-    if (isa<AllocaInst>(Addr)) {
-      return true;
-    }
   } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
     IsStore = true;
     Alignment = 0;
     Addr = RMW->getPointerOperand();
-    if (isa<AllocaInst>(Addr)) {
-      return true;
-    }
   } else if (AtomicCmpXchgInst *Xchg = dyn_cast<AtomicCmpXchgInst>(I)) {
     IsStore = true;
     Alignment = 0;
     Addr = Xchg->getPointerOperand();
-    if (isa<AllocaInst>(Addr)) {
-      return true;
-    }
   } else
     llvm_unreachable("Unsupported mem access type");
+
+  const Value* Parent = GetUnderlyingObject(Addr, DL);
+  if (isa<AllocaInst>(Parent)) {
+    return true;
+  }
 
   Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
   const uint32_t TypeSizeBytes = DL.getTypeStoreSizeInBits(OrigTy) / 8;
