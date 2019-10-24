@@ -39,6 +39,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <cxxabi.h>
+#include <algorithm>
 #include <fstream>
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/Support/FileSystem.h>
@@ -61,6 +62,8 @@ STATISTIC(NumInstrumentedStores, "Number of instrumented stores");
 STATISTIC(NumInstructions, "Number of instructions");
 STATISTIC(NumAccessesWithIrregularSize,
           "Number of accesses with a size outside our targeted callout sizes");
+STATISTIC(NumAllocaReferencesSkipped,
+              "Number of load/store instructions that reference an alloca region");
 
 static const uint64_t MemoroCtorAndDtorPriority = 0;
 static const char *const MemoroModuleCtorName = "memoro.module_ctor";
@@ -205,8 +208,42 @@ bool Memoro::initOnModule(Module &M) {
 }
 
 bool Memoro::shouldIgnoreMemoryAccess(Instruction *I) {
-  // don't ignore anything for now
-  return false;
+  NumInstructions++;
+
+  Value *Addr = nullptr;
+  if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+    Addr = LI->getPointerOperand();
+  } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+    Addr = SI->getPointerOperand();
+  } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
+    Addr = RMW->getPointerOperand();
+  } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
+    Addr = XCHG->getPointerOperand();
+  }
+  else {
+    return false;
+  }
+
+  SmallVector<Value *, 4> Objs;
+  DataLayout DL = I->getModule()->getDataLayout();
+  getUnderlyingObjectsForCodeGen(Addr, Objs, DL);
+
+  if (Objs.empty()) {
+    return false;   // Don't know what it references
+  }
+
+  // All Objs' value must not be on the heap to safely ignore them.
+  // Alloca and global variables are not in the heap. Anything else?
+  bool IsNonHeap = std::all_of(Objs.begin(), Objs.end(),
+      [](Value *V){ return isa<AllocaInst>(V) || isa<GlobalVariable>(V); });
+
+  // One operand might target the heap: can't ignore this access
+  if (!IsNonHeap) {
+    return false;
+  }
+
+  NumAllocaReferencesSkipped++;
+  return true;
 }
 
 bool Memoro::runOnModule(Module &M) {
@@ -368,7 +405,6 @@ bool Memoro::runOnFunction(Function &F, Module &M, raw_fd_ostream &type_file) {
 }
 
 bool Memoro::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
-  NumInstructions++;
   IRBuilder<> IRB(I);
   bool IsStore;
   Value *Addr;
@@ -391,11 +427,6 @@ bool Memoro::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
     Addr = Xchg->getPointerOperand();
   } else
     llvm_unreachable("Unsupported mem access type");
-
-  const Value* Parent = GetUnderlyingObject(Addr, DL);
-  if (isa<AllocaInst>(Parent)) {
-    return true;
-  }
 
   Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
   const uint32_t TypeSizeBytes = DL.getTypeStoreSizeInBits(OrigTy) / 8;
