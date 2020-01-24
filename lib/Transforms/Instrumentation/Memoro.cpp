@@ -32,6 +32,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -42,6 +43,7 @@
 #include <cxxabi.h>
 #include <algorithm>
 #include <fstream>
+#include <unordered_map>
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
@@ -83,6 +85,11 @@ namespace {
 
 using FunctionCallee = Function*;
 
+struct ConstVals {
+  Value* StackBottom;
+  Value* StackRange;
+};
+
 /// Memoro: instrument each module to find performance issues.
 class Memoro : public ModulePass {
 public:
@@ -102,6 +109,7 @@ private:
   bool instrumentMemIntrinsic(MemIntrinsic *MI);
   bool shouldIgnoreMemoryAccess(Instruction *I);
   int getMemoryAccessFuncIndex(Value *Addr, const DataLayout &DL);
+  ConstVals getConstValsForF(Function*);
   void maybeInferMallocNewType(CallInst *CI, raw_fd_ostream &type_file);
   void inferMallocNewType(CallInst *CI, StringRef const &name,
                           raw_fd_ostream &type_file);
@@ -121,9 +129,15 @@ private:
   FunctionCallee MemoroCheckStack;
   Function *MemoroCtorFunction;
   Function *MemoroDtorFunction;
+  // Flags struct to inline checks
+  StructType *MemoroFlagsTy;
+  Constant *MemoroFlagsGlobal;
+  Constant *MemoroStackTopGlobal;
+  Constant *MemoroSampleCounterGlobal;
   // file we will dump alloc point type info to
   // std::ofstream type_file;
   // raw_fd_ostream type_file;
+  std::unordered_map<Function*, ConstVals> FConstVals;
 };
 } // namespace
 
@@ -141,6 +155,28 @@ void Memoro::getAnalysisUsage(AnalysisUsage &AU) const {
 }
 
 ModulePass *llvm::createMemoroPass() { return new Memoro(); }
+
+// This function is not yet available in our version of LLVM
+// It is copied here, but should be replaced by the proper call in the next version
+Constant *futureGetOrInsertGlobal(
+    Module &M, StringRef Name, Type *Ty,
+    function_ref<GlobalVariable *()> CreateGlobalCallback) {
+  // See if we have a definition for the specified global already.
+  GlobalVariable *GV = dyn_cast_or_null<GlobalVariable>(M.getNamedValue(Name));
+  if (!GV)
+    GV = CreateGlobalCallback();
+  assert(GV && "The CreateGlobalCallback is expected to create a global");
+
+  // If the variable exists but has the wrong type, return a bitcast to the
+  // right type.
+  Type *GVTy = GV->getType();
+  PointerType *PTy = PointerType::get(Ty, GVTy->getPointerAddressSpace());
+  if (GVTy != PTy)
+    return ConstantExpr::getBitCast(GV, PTy);
+
+  // Otherwise, we just found the existing function or a prototype.
+  return GV;
+}
 
 void Memoro::initializeCallbacks(Module &M) {
   IRBuilder<> IRB(M.getContext());
@@ -185,6 +221,22 @@ void Memoro::initializeCallbacks(Module &M) {
   MemsetFn = checkSanitizerInterfaceFunction(
       M.getOrInsertFunction("memset", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
                             IRB.getInt32Ty(), IntptrTy));
+
+  MemoroFlagsTy = StructType::create(
+      {IRB.getInt8Ty(), IRB.getInt8Ty(), IRB.getInt8Ty(), IRB.getInt8Ty(),
+       IRB.getInt8Ty(), IRB.getInt8Ty(), IRB.getInt32Ty(), IRB.getInt8Ty()});
+
+  MemoroFlagsGlobal = M.getOrInsertGlobal("MemoroFlagsDontUseDirectly", MemoroFlagsTy);
+
+  MemoroStackTopGlobal = futureGetOrInsertGlobal(M, "current_stack_end", IRB.getInt64Ty(), [&] {
+      return new GlobalVariable(M, IRB.getInt64Ty(), false, GlobalVariable::ExternalLinkage,
+          nullptr, "current_stack_end", nullptr, GlobalValue::GeneralDynamicTLSModel);
+      });
+
+  MemoroSampleCounterGlobal = futureGetOrInsertGlobal(M, "sample_hits_noatomic", IRB.getInt32Ty(), [&] {
+      return new GlobalVariable(M, IRB.getInt32Ty(), false, GlobalVariable::ExternalLinkage,
+          nullptr, "sample_hits_noatomic", nullptr, GlobalValue::GeneralDynamicTLSModel);
+      });
 }
 
 void Memoro::createDestructor(Module &M) {
@@ -421,6 +473,24 @@ bool Memoro::runOnFunction(Function &F, Module &M, raw_fd_ostream &type_file) {
   return Res;
 }
 
+ConstVals Memoro::getConstValsForF(Function *F) {
+  auto Consts = FConstVals.find(F);
+  if (Consts != FConstVals.end())
+    return Consts->second;
+
+  BasicBlock& BB = F->getEntryBlock();
+  IRBuilder<> IRB(&BB, BB.getFirstInsertionPt());
+
+  Value *Zero = ConstantInt::get(IRB.getInt32Ty(), 0);
+  Instruction *StackTopVal = IRB.CreateLoad(MemoroStackTopGlobal);
+  Value *StackBottomAddr = IRB.CreateAlloca(IRB.getInt8Ty(), Zero);
+  Value *StackBottomVal = IRB.CreatePtrToInt(StackBottomAddr, IRB.getInt64Ty());
+  Value *StackRange = IRB.CreateSub(StackTopVal, StackBottomVal);
+
+  FConstVals.insert({F, {StackBottomVal, StackRange}});
+  return {StackBottomVal, StackRange};
+}
+
 bool Memoro::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
   IRBuilder<> IRB(I);
   bool IsStore;
@@ -459,6 +529,42 @@ bool Memoro::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
     NumInstrumentedStores++;
   else
     NumInstrumentedLoads++;
+
+  // Memoro enabled check
+  Value *Zero = ConstantInt::get(IRB.getInt32Ty(), 0);
+  Value *One  = ConstantInt::get(IRB.getInt32Ty(), 1);
+  Value *Six  = ConstantInt::get(IRB.getInt32Ty(), 6);
+  Value *AccessSamplingRateAddr = IRB.CreateGEP(
+      MemoroFlagsTy, MemoroFlagsGlobal, {Zero, Six});
+  Value *AccessSamplingRateVal = IRB.CreateLoad(AccessSamplingRateAddr, true);
+  Value *MemoroEnabledCond = IRB.CreateICmpNE(AccessSamplingRateVal, Zero);
+  Instruction* MemoroEnabledTerm = SplitBlockAndInsertIfThen(MemoroEnabledCond, I, false);
+  IRB.SetInsertPoint(MemoroEnabledTerm);
+
+  // Is stack check
+  auto Consts = getConstValsForF(I->getFunction());
+  Value *AddrVal = IRB.CreatePtrToInt(Addr, IRB.getInt64Ty());
+  Value *AddrRange = IRB.CreateSub(AddrVal, Consts.StackBottom);
+  Value *IsNotStack = IRB.CreateICmpUGE(AddrRange, Consts.StackRange);
+  Instruction *HeapAddrTerm = nullptr, *StackAddrTerm = nullptr;
+  SplitBlockAndInsertIfThenElse(IsNotStack, MemoroEnabledTerm, &HeapAddrTerm, &StackAddrTerm);
+
+  // Check the stack check!
+  if (ClCheckStackAccess) {
+    IRB.SetInsertPoint(StackAddrTerm);
+    IRB.CreateCall(MemoroCheckStack, IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()));
+  }
+
+  IRB.SetInsertPoint(HeapAddrTerm);
+
+  // Sampling check
+  Value *SampleCounter = IRB.CreateLoad(MemoroSampleCounterGlobal);
+  Value *SampleCounterDec = IRB.CreateSub(SampleCounter, One);
+  IRB.CreateStore(SampleCounterDec, MemoroSampleCounterGlobal);
+  Value *IsSampled = IRB.CreateICmpEQ(SampleCounterDec, Zero);
+  Instruction *SampledTerm = SplitBlockAndInsertIfThen(IsSampled, HeapAddrTerm, false);
+  IRB.SetInsertPoint(SampledTerm);
+
   int Idx = getMemoryAccessFuncIndex(Addr, DL);
   if (Idx < 0) {
     OnAccessFunc = IsStore ? MemoroUnalignedStoreN : MemoroUnalignedLoadN;
