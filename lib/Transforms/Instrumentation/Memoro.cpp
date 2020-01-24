@@ -24,6 +24,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Function.h"
@@ -56,14 +57,18 @@ static cl::opt<bool> ClInstrumentLoadsAndStores(
 static cl::opt<bool> ClInstrumentMemIntrinsics(
     "memoro-instrument-memintrinsics", cl::init(true),
     cl::desc("Instrument memintrinsics (memset/memcpy/memmove)"), cl::Hidden);
+static cl::opt<bool> ClCheckStackAccess(
+    "memoro-check-stack-accesses", cl::init(false),
+    cl::desc("Check at run-time if discarded instrumentation only touch the stack"), cl::Hidden);
 
 STATISTIC(NumInstrumentedLoads, "Number of instrumented loads");
 STATISTIC(NumInstrumentedStores, "Number of instrumented stores");
-STATISTIC(NumInstructions, "Number of instructions");
-STATISTIC(NumAccessesWithIrregularSize,
-          "Number of accesses with a size outside our targeted callout sizes");
+STATISTIC(NumInstrumented, "Total number of instrumented loads/stores");
+STATISTIC(NumInstructionMet, "Number of instructions considered");
 STATISTIC(NumAllocaReferencesSkipped,
               "Number of load/store instructions that reference an alloca region");
+STATISTIC(NumAccessesWithIrregularSize,
+          "Number of accesses with a size outside our targeted callout sizes");
 
 static const uint64_t MemoroCtorAndDtorPriority = 0;
 static const char *const MemoroModuleCtorName = "memoro.module_ctor";
@@ -75,6 +80,8 @@ static const char *const MemoroExitName = "__memoro_exit";
 // the ctor is called in some cases, so we set a global variable.
 
 namespace {
+
+using FunctionCallee = Function*;
 
 /// Memoro: instrument each module to find performance issues.
 class Memoro : public ModulePass {
@@ -104,13 +111,14 @@ private:
   // Our slowpath involves callouts to the runtime library.
   // Access sizes are powers of two: 1, 2, 4, 8, 16.
   static const size_t NumberOfAccessSizes = 5;
-  Function *MemoroAlignedLoad[NumberOfAccessSizes];
-  Function *MemoroAlignedStore[NumberOfAccessSizes];
-  Function *MemoroUnalignedLoad[NumberOfAccessSizes];
-  Function *MemoroUnalignedStore[NumberOfAccessSizes];
+  FunctionCallee MemoroAlignedLoad[NumberOfAccessSizes];
+  FunctionCallee MemoroAlignedStore[NumberOfAccessSizes];
+  FunctionCallee MemoroUnalignedLoad[NumberOfAccessSizes];
+  FunctionCallee MemoroUnalignedStore[NumberOfAccessSizes];
   // For irregular sizes of any alignment:
-  Function *MemoroUnalignedLoadN, *MemoroUnalignedStoreN;
-  Function *MemmoveFn, *MemcpyFn, *MemsetFn;
+  FunctionCallee MemoroUnalignedLoadN, MemoroUnalignedStoreN;
+  FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
+  FunctionCallee MemoroCheckStack;
   Function *MemoroCtorFunction;
   Function *MemoroDtorFunction;
   // file we will dump alloc point type info to
@@ -166,6 +174,8 @@ void Memoro::initializeCallbacks(Module &M) {
   MemoroUnalignedStoreN = checkSanitizerInterfaceFunction(
       M.getOrInsertFunction("__memoro_unaligned_storeN", IRB.getVoidTy(),
                             IRB.getInt8PtrTy(), IntptrTy));
+  MemoroCheckStack = checkSanitizerInterfaceFunction(
+      M.getOrInsertFunction("__memoro_check_stack", IRB.getVoidTy(), IRB.getInt8PtrTy()));
   MemmoveFn = checkSanitizerInterfaceFunction(
       M.getOrInsertFunction("memmove", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
                             IRB.getInt8PtrTy(), IntptrTy));
@@ -183,7 +193,7 @@ void Memoro::createDestructor(Module &M) {
                        GlobalValue::InternalLinkage, MemoroModuleDtorName, &M);
   ReturnInst::Create(*Ctx, BasicBlock::Create(*Ctx, "", MemoroDtorFunction));
   IRBuilder<> IRB_Dtor(MemoroDtorFunction->getEntryBlock().getTerminator());
-  Function *MemoroExit = checkSanitizerInterfaceFunction(
+  FunctionCallee MemoroExit = checkSanitizerInterfaceFunction(
       M.getOrInsertFunction(MemoroExitName, IRB_Dtor.getVoidTy()));
   MemoroExit->setLinkage(Function::ExternalLinkage);
   IRB_Dtor.CreateCall(MemoroExit);
@@ -208,7 +218,7 @@ bool Memoro::initOnModule(Module &M) {
 }
 
 bool Memoro::shouldIgnoreMemoryAccess(Instruction *I) {
-  NumInstructions++;
+  NumInstructionMet++;
 
   Value *Addr = nullptr;
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
@@ -219,8 +229,7 @@ bool Memoro::shouldIgnoreMemoryAccess(Instruction *I) {
     Addr = RMW->getPointerOperand();
   } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
     Addr = XCHG->getPointerOperand();
-  }
-  else {
+  } else {
     return false;
   }
 
@@ -242,6 +251,11 @@ bool Memoro::shouldIgnoreMemoryAccess(Instruction *I) {
     return false;
   }
 
+  if (ClCheckStackAccess) {
+    IRBuilder<> IRB(I);
+    IRB.CreateCall(MemoroCheckStack, IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()));
+  }
+
   NumAllocaReferencesSkipped++;
   return true;
 }
@@ -260,8 +274,11 @@ bool Memoro::runOnModule(Module &M) {
                '.');
 
   std::error_code EC;
-  raw_fd_ostream type_file((dir + sys::path::get_separator() + filename).str(),
-                           EC, sys::fs::F_Text);
+  std::string&& type_file_path = (dir + sys::path::get_separator() + filename).str();
+  raw_fd_ostream type_file(type_file_path, EC, sys::fs::F_Text);
+  if (EC) {
+    report_fatal_error(EC.message() + ": " + type_file_path);
+  }
 
   bool Res = initOnModule(M);
   initializeCallbacks(M);
@@ -428,9 +445,11 @@ bool Memoro::instrumentLoadOrStore(Instruction *I, const DataLayout &DL) {
   } else
     llvm_unreachable("Unsupported mem access type");
 
+  NumInstrumented++;
+
   Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
   const uint32_t TypeSizeBytes = DL.getTypeStoreSizeInBits(OrigTy) / 8;
-  Value *OnAccessFunc = nullptr;
+  FunctionCallee OnAccessFunc = nullptr;
 
   // Convert 0 to the default alignment.
   if (Alignment == 0)
